@@ -348,12 +348,19 @@ pub fn rustup_download_list(
     download_gz: bool,
     download_xz: bool,
     platforms: &Platforms,
-) -> Result<(String, Vec<(String, String)>), SyncError> {
+) -> Result<(String, String, Vec<(String, String)>), SyncError> {
     let channel_str = fs::read_to_string(path).map_err(DownloadError::Io)?;
     let channel: Channel = toml_edit::easy::from_str(&channel_str)?;
+    let version = channel
+        .pkg
+        .get("rust-src")
+        .and_then(|pkg| pkg.version.split_ascii_whitespace().next())
+        .map(|v| v.to_string())
+        .unwrap_or_default();
 
     Ok((
         channel.date,
+        version,
         channel
             .pkg
             .into_iter()
@@ -587,7 +594,7 @@ pub async fn sync_rustup_channel(
     platforms: &Platforms,
 ) -> Result<(), SyncError> {
     // Download channel file
-    let (channel_url, channel_path, extra_files) =
+    let (channel_url, channel_path, mut extra_files) =
         if let Some(inner_channel) = channel.strip_prefix("nightly-") {
             let url = format!("{source}/dist/{inner_channel}/channel-rust-nightly.toml");
             let path_chunk = format!("dist/{inner_channel}/channel-rust-nightly.toml");
@@ -613,7 +620,7 @@ pub async fn sync_rustup_channel(
     .await?;
 
     // Open toml file, find all files to download
-    let (date, files) = rustup_download_list(
+    let (date, version, files) = rustup_download_list(
         &channel_part_path,
         download_dev,
         download_gz,
@@ -621,6 +628,33 @@ pub async fn sync_rustup_channel(
         platforms,
     )?;
     move_if_exists_with_sha256(&channel_part_path, &channel_path)?;
+    let mut stable_manifest = get_stable_manifest_name(channel, &date, &version);
+    if !stable_manifest.is_empty() {
+        stable_manifest.insert_str(0, "dist/");
+        if !channel_path
+            .to_str()
+            .map(|p| p.ends_with(&stable_manifest))
+            .unwrap_or(false)
+        {
+            if let Err(e) =
+                copy_file_create_dir_with_sha256(&channel_path, &path.join(&stable_manifest))
+            {
+                eprintln!();
+                eprintln!(
+                    "Failed to create stable manifest file {}: {:?}",
+                    stable_manifest, e
+                );
+            } else {
+                extra_files.push(format!("{}.sha256", stable_manifest));
+                extra_files.push(stable_manifest);
+            }
+        }
+    } else {
+        eprintln!(
+            "Coudln't determine version of {} from manifest, not pinning.",
+            channel
+        );
+    }
 
     let pb = panamax_progress_bar(files.len(), prefix);
     pb.enable_steady_tick(Duration::from_millis(10));
@@ -890,4 +924,51 @@ pub async fn sync(
     eprintln!("{}", style("Syncing Rustup repositories complete!").bold());
 
     Ok(())
+}
+
+fn get_stable_manifest_name(channel: &str, date: &str, version: &str) -> String {
+    if channel == "nightly" || channel.starts_with("nightly-") || version.ends_with("-nightly") {
+        format!("{date}/channel-rust-nightly.toml")
+    } else if !version.is_empty() {
+        format!("channel-rust-{version}.toml")
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::rustup::get_stable_manifest_name;
+
+    #[test]
+    fn test_manifest_name_stable() {
+        assert_eq!(
+            get_stable_manifest_name("stable", "2025-07-27", "1.88"),
+            "channel-rust-1.88.toml"
+        );
+    }
+
+    #[test]
+    fn test_manifest_name_nightly_latest() {
+        assert_eq!(
+            get_stable_manifest_name("nightly", "2025-07-27", "1.90.0-nightly"),
+            "2025-07-27/channel-rust-nightly.toml"
+        );
+    }
+
+    #[test]
+    fn test_manifest_name_nightly_pinned() {
+        assert_eq!(
+            get_stable_manifest_name("nightly-2025-07-27", "2025-07-27", "1.90.0-nightly"),
+            "2025-07-27/channel-rust-nightly.toml"
+        );
+    }
+
+    #[test]
+    fn test_manifest_name_stable_pinned() {
+        assert_eq!(
+            get_stable_manifest_name("1.88.0", "2025-07-27", "1.88.0"),
+            "channel-rust-1.88.0.toml"
+        );
+    }
 }
